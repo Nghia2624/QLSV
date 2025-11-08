@@ -1,0 +1,217 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database (Write-side)
+  postgres:
+    image: postgres:16-alpine
+    container_name: qlsv-postgres
+    environment:
+      POSTGRES_USER: qlsv
+      POSTGRES_PASSWORD: qlsv123
+      POSTGRES_DB: qlsvdb
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports: 
+      - "5433:5432"
+    volumes: 
+      - "pgdata:/var/lib/postgresql/data"
+      - "./migrations:/docker-entrypoint-initdb.d"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U qlsv -d qlsvdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - qlsv-network
+
+  # MongoDB Database (Read-side)
+  mongo:
+    image: mongo:7
+    container_name: qlsv-mongo
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: qlsv
+      MONGO_INITDB_ROOT_PASSWORD: qlsv123
+      MONGO_INITDB_DATABASE: qlsvdb
+    ports: 
+      - "27018:27017"
+    volumes: 
+      - "mongodata:/data/db"
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh qlsv:qlsv123@localhost:27017/admin --quiet
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - qlsv-network
+
+  # Zookeeper (Required for Kafka)
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: qlsv-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_SYNC_LIMIT: 2
+      ZOOKEEPER_INIT_LIMIT: 5
+    healthcheck:
+      test: echo stat | nc localhost 2181
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - qlsv-network
+
+  # Kafka Message Broker
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: qlsv-kafka
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,EXTERNAL://0.0.0.0:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_DELETE_TOPIC_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_LOG_RETENTION_BYTES: 1073741824
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+    ports: 
+      - "9093:9093"
+    depends_on: 
+      zookeeper:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - qlsv-network
+
+  # Command Service (Write API)
+  command-service:
+    build:
+      context: .
+      dockerfile: cmd/command-service/Dockerfile
+    container_name: qlsv-command-service
+    environment:
+      APP_ENV: production
+      LOG_LEVEL: INFO
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: qlsv
+      POSTGRES_PASSWORD: qlsv123
+      POSTGRES_DB: qlsvdb
+      MONGO_URI: mongodb://qlsv:qlsv123@mongo:27017/qlsvdb?authSource=admin&authMechanism=SCRAM-SHA-256
+      MONGO_DB: qlsvdb
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: qlsv-events
+      KAFKA_CONSUMER_GROUP: qlsv-command-group
+      JWT_SECRET_KEY: qlsv-super-secret-key-change-in-production
+      JWT_EXPIRATION: 24h
+      KAFKA_STUDENT_TOPIC: student-events
+      KAFKA_TEACHER_TOPIC: teacher-events
+      KAFKA_COURSE_TOPIC: course-events
+      KAFKA_CLASS_TOPIC: class-events
+      KAFKA_REGISTRATION_TOPIC: registration-events
+      KAFKA_USER_TOPIC: user-events
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports: 
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - qlsv-network
+
+  # Query Service (Read API)
+  query-service:
+    build:
+      context: .
+      dockerfile: cmd/query-service/Dockerfile
+    container_name: qlsv-query-service
+    environment:
+      APP_ENV: production
+      LOG_LEVEL: INFO
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: qlsv
+      POSTGRES_PASSWORD: qlsv123
+      POSTGRES_DB: qlsvdb
+      MONGO_URI: mongodb://qlsv:qlsv123@mongo:27017/qlsvdb?authSource=admin&authMechanism=SCRAM-SHA-256
+      MONGO_DB: qlsvdb
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: qlsv-events
+      KAFKA_CONSUMER_GROUP: qlsv-query-group
+      JWT_SECRET_KEY: qlsv-super-secret-key-change-in-production
+      JWT_EXPIRATION: 24h
+      KAFKA_STUDENT_TOPIC: student-events
+      KAFKA_TEACHER_TOPIC: teacher-events
+      KAFKA_COURSE_TOPIC: course-events
+      KAFKA_CLASS_TOPIC: class-events
+      KAFKA_REGISTRATION_TOPIC: registration-events
+      KAFKA_USER_TOPIC: user-events
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports: 
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - qlsv-network
+
+  # Kafka UI (Optional - for monitoring)
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: qlsv-kafka-ui
+    environment:
+      KAFKA_CLUSTERS_0_NAME: qlsv-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    ports:
+      - "8082:8080"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - qlsv-network
+
+volumes:
+  pgdata:
+    driver: local
+  mongodata: 
+    driver: local
+
+networks:
+  qlsv-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16 
